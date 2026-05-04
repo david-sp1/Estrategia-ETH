@@ -1,7 +1,13 @@
 """
 Estrategia ETH "Trend-Sustainer"
-Fuente de datos: ETF 21Shares Ethereum Core Staking ETP (ETHC.DE, Xetra)
-ISIN: CH1209763130  — datos vía yfinance (público, sin API key).
+
+Fuentes de datos:
+  - Índice : ETH-EUR  (Yahoo Finance) — serie larga, todos los indicadores
+  - ETF    : ETHC.DE  (Yahoo Finance, ISIN CH1209763130) — precio y stop loss
+
+El stop loss se calcula en precio del índice ETH-EUR y se traduce al ETF
+usando el ratio actual entre ambos. Si el ETF no está disponible, se
+informa con el stop estimado y el mensaje se envía igualmente.
 """
 
 import json
@@ -16,48 +22,35 @@ import yfinance as yf
 logger = logging.getLogger(__name__)
 
 # ── Parámetros de la estrategia ───────────────────────────────────────────────
-PERIODO_DONCHIAN = 50
-PERIODO_SMA = 200
-PERIODO_ADX = 14
-MULTIPLICADOR_ATR = 3.5
+PERIODO_DONCHIAN   = 50
+PERIODO_SMA        = 200
+PERIODO_ADX        = 14
+MULTIPLICADOR_ATR  = 3.5
 UMBRAL_ADX_ENTRADA = 25
 
-# Ticker del ETF en Yahoo Finance (Xetra, EUR)
-ETF_TICKER = os.environ.get("ETF_TICKER", "ETHC.DE")
-CURRENCY = "EUR"
+INDEX_TICKER = os.environ.get("INDEX_TICKER", "ETH-EUR")
+ETF_TICKER   = os.environ.get("ETF_TICKER",   "ETHC.DE")
+CURRENCY     = "EUR"
 
-# Archivo de estado persistente (posición abierta)
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/data/state.json"))
 
 
-# ── Datos de mercado ──────────────────────────────────────────────────────────
+# ── Excepciones ───────────────────────────────────────────────────────────────
 
 class MercadoCerradoError(Exception):
-    """Se lanza cuando el último dato disponible es de un día no hábil."""
+    """Fin de semana o festivo: no hay datos nuevos."""
     pass
 
 
-def fetch_ohlcv(ticker: str = ETF_TICKER, period: str = "2y") -> pd.DataFrame:
-    """
-    Descarga velas diarias del ETF via yfinance.
-    - period="2y" garantiza más de 200 velas para la SMA200.
-    - El índice queda en UTC (días hábiles europeos, L–V).
-    Lanza MercadoCerradoError si hoy es fin de semana o festivo.
-    """
-    hoy = date.today()
-    if hoy.weekday() >= 5:  # 5=sábado, 6=domingo
-        raise MercadoCerradoError(
-            f"Hoy es {'sábado' if hoy.weekday()==5 else 'domingo'} "
-            f"({hoy}). El mercado Xetra no opera. El bot no envía informe."
-        )
+# ── Descarga de datos ─────────────────────────────────────────────────────────
 
+def _download(ticker: str, period: str = "5y") -> pd.DataFrame:
+    """Descarga OHLCV de yfinance y normaliza columnas."""
     raw = yf.download(ticker, period=period, interval="1d",
                       auto_adjust=True, progress=False)
-
     if raw.empty:
-        raise ValueError(f"yfinance no devolvió datos para {ticker}")
+        raise ValueError(f"yfinance no devolvio datos para {ticker}")
 
-    # yfinance puede devolver MultiIndex de columnas con el ticker
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
 
@@ -65,13 +58,40 @@ def fetch_ohlcv(ticker: str = ETF_TICKER, period: str = "2y") -> pd.DataFrame:
     df.columns = ["open", "high", "low", "close", "volume"]
     df.index = pd.to_datetime(df.index, utc=True)
     df = df.dropna(subset=["close"])
-
-    # Comprobación adicional: si el último día hábil fue festivo,
-    # yfinance devuelve datos hasta el último día con cotización.
-    # No es un error — simplemente usamos ese último cierre disponible.
-    logger.info(f"Último dato disponible: {df.index[-1].date()} | Cierre: {df['close'].iloc[-1]:.4f} {CURRENCY}")
-
     return df
+
+
+def fetch_index(period: str = "5y") -> pd.DataFrame:
+    """
+    Descarga el indice ETH-EUR. Lanza MercadoCerradoError en fin de semana
+    (referencia al horario del ETF en Xetra).
+    """
+    hoy = date.today()
+    if hoy.weekday() >= 5:
+        nombre = "sabado" if hoy.weekday() == 5 else "domingo"
+        raise MercadoCerradoError(
+            f"Hoy es {nombre} ({hoy}). El mercado Xetra no opera."
+        )
+    df = _download(INDEX_TICKER, period)
+    logger.info(f"[{INDEX_TICKER}] Ultimo dato: {df.index[-1].date()} | "
+                f"Cierre: {df['close'].iloc[-1]:,.2f} {CURRENCY}")
+    return df
+
+
+def fetch_etf() -> dict | None:
+    """
+    Descarga el precio mas reciente de ETHC.DE.
+    Devuelve dict con precio y fecha, o None si falla.
+    """
+    try:
+        df = _download(ETF_TICKER, period="1y")
+        precio = float(df["close"].iloc[-1])
+        fecha  = df.index[-1].strftime("%Y-%m-%d")
+        logger.info(f"[{ETF_TICKER}] Ultimo dato: {fecha} | Cierre: {precio:.4f} {CURRENCY}")
+        return {"precio": precio, "fecha": fecha}
+    except Exception as e:
+        logger.warning(f"[{ETF_TICKER}] No disponible: {e}")
+        return None
 
 
 # ── Indicadores ───────────────────────────────────────────────────────────────
@@ -90,27 +110,26 @@ def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
     tr = pd.concat([
         high - low,
         (high - prev_close).abs(),
-        (low - prev_close).abs(),
+        (low  - prev_close).abs(),
     ], axis=1).max(axis=1)
     return tr.ewm(span=period, adjust=False).mean()
 
 
 def calc_adx(df: pd.DataFrame, period: int) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
+    high, low = df["high"], df["low"]
     prev_high = high.shift(1)
-    prev_low = low.shift(1)
+    prev_low  = low.shift(1)
 
-    plus_dm = high - prev_high
+    plus_dm  = high - prev_high
     minus_dm = prev_low - low
-    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
-    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    plus_dm  = plus_dm.where( (plus_dm  > minus_dm) & (plus_dm  > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm)  & (minus_dm > 0), 0.0)
 
-    atr = calc_atr(df, period)
-    plus_di = 100 * (plus_dm.ewm(span=period, adjust=False).mean() / atr)
+    atr      = calc_atr(df, period)
+    plus_di  = 100 * (plus_dm.ewm( span=period, adjust=False).mean() / atr)
     minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / atr)
-    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).fillna(0)
-    adx = dx.ewm(span=period, adjust=False).mean()
-    return adx
+    dx       = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).fillna(0)
+    return dx.ewm(span=period, adjust=False).mean()
 
 
 # ── Estado persistente ────────────────────────────────────────────────────────
@@ -119,7 +138,8 @@ def load_state() -> dict:
     if STATE_FILE.exists():
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {"position_open": False, "entry_price": None, "stop_loss": None}
+    return {"position_open": False, "entry_price": None,
+            "stop_loss": None, "stop_loss_etf": None, "etf_ratio": None}
 
 
 def save_state(state: dict):
@@ -128,92 +148,137 @@ def save_state(state: dict):
         json.dump(state, f, indent=2)
 
 
-# ── Stop Loss dinámico con trinquete ─────────────────────────────────────────
+# ── Stop Loss dinamico con trinquete ─────────────────────────────────────────
 
-def calc_stop(price: float, atr: float, donchian_low: float, prev_stop: float | None) -> float:
-    opcion_a = price - (atr * MULTIPLICADOR_ATR)
-    opcion_b = donchian_low
+def calc_stop(price: float, atr: float, donchian_low: float,
+              prev_stop: float | None) -> float:
+    opcion_a      = price - (atr * MULTIPLICADOR_ATR)
+    opcion_b      = donchian_low
     stop_sugerido = max(opcion_a, opcion_b)
     if prev_stop is not None and stop_sugerido < prev_stop:
         return prev_stop
     return stop_sugerido
 
 
-# ── Motor de decisión ─────────────────────────────────────────────────────────
+def traducir_stop_a_etf(stop_index: float, precio_index: float,
+                         precio_etf: float) -> float:
+    """Convierte el stop del indice al precio equivalente del ETF."""
+    ratio = precio_etf / precio_index
+    return stop_index * ratio
+
+
+# ── Motor de decision ─────────────────────────────────────────────────────────
 
 def decide(price: float, sma200: float, adx: float,
-           donchian_high_prev: float, stop: float,
-           state: dict) -> tuple[str, str]:
+           donchian_high_prev: float, state: dict) -> tuple[str, str]:
     if not state["position_open"]:
-        if price > sma200 and adx > UMBRAL_ADX_ENTRADA and price >= donchian_high_prev:
+        if (price > sma200 and adx > UMBRAL_ADX_ENTRADA
+                and price >= donchian_high_prev):
             return "COMPRAR", "Ruptura confirmada con fuerza de tendencia"
         return "ESPERAR", "Mercado sin condiciones de entrada"
     else:
         if price < sma200 or price < state["stop_loss"]:
-            return "VENDER", "Ruptura de soporte crítico o media de largo plazo"
-        return "MANTENER", "Tendencia intacta o mercado lateral dentro de límites"
+            return "VENDER", "Ruptura de soporte critico o media de largo plazo"
+        return "MANTENER", "Tendencia intacta o mercado lateral dentro de limites"
 
 
-# ── Análisis principal ────────────────────────────────────────────────────────
+# ── Analisis principal ────────────────────────────────────────────────────────
 
 def run_analysis() -> dict:
-    df = fetch_ohlcv()  # MercadoCerradoError se propaga hacia arriba si procede
+    # ── 1. Indice ETH-EUR ─────────────────────────────────────────────────────
+    df = fetch_index()  # lanza MercadoCerradoError si procede
 
-    df["sma200"] = calc_sma(df["close"], PERIODO_SMA)
-    df["donchian_high"], df["donchian_low"] = calc_donchian(df["high"], df["low"], PERIODO_DONCHIAN)
+    df["sma200"]                           = calc_sma(df["close"], PERIODO_SMA)
+    df["donchian_high"], df["donchian_low"] = calc_donchian(
+        df["high"], df["low"], PERIODO_DONCHIAN)
     df["atr"] = calc_atr(df, PERIODO_ADX)
     df["adx"] = calc_adx(df, PERIODO_ADX)
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    price = float(last["close"])
-    sma200 = float(last["sma200"])
-    donchian_high = float(last["donchian_high"])
-    donchian_low = float(last["donchian_low"])
-    donchian_high_prev = float(prev["donchian_high"])  # rompida en cierre actual
-    atr = float(last["atr"])
-    adx = float(last["adx"])
+    price_idx          = float(last["close"])
+    sma200             = float(last["sma200"])
+    donchian_high      = float(last["donchian_high"])
+    donchian_low       = float(last["donchian_low"])
+    donchian_high_prev = float(prev["donchian_high"])
+    atr                = float(last["atr"])
+    adx                = float(last["adx"])
+    data_date_idx      = df.index[-1].strftime("%Y-%m-%d")
 
-    state = load_state()
+    # ── 2. Estado y stop loss en precio del indice ────────────────────────────
+    state     = load_state()
     prev_stop = state.get("stop_loss")
 
-    stop = calc_stop(price, atr, donchian_low, prev_stop)
+    stop_idx         = calc_stop(price_idx, atr, donchian_low, prev_stop)
+    decision, reason = decide(price_idx, sma200, adx, donchian_high_prev, state)
 
-    decision, reason = decide(price, sma200, adx, donchian_high_prev, stop, state)
+    # ── 3. ETF ETHC.DE ────────────────────────────────────────────────────────
+    etf_data = fetch_etf()  # None si no disponible
 
-    # Actualizar estado
+    if etf_data is not None:
+        precio_etf = etf_data["precio"]
+        fecha_etf  = etf_data["fecha"]
+        stop_etf   = traducir_stop_a_etf(stop_idx, price_idx, precio_etf)
+        etf_ok     = True
+        state["etf_ratio"] = precio_etf / price_idx  # actualizamos ratio
+    else:
+        precio_etf = None
+        fecha_etf  = None
+        last_ratio = state.get("etf_ratio")
+        stop_etf   = round(stop_idx * last_ratio, 4) if last_ratio else None
+        etf_ok     = False
+
+    # ── 4. Actualizar estado ──────────────────────────────────────────────────
     if decision == "COMPRAR":
         state["position_open"] = True
-        state["entry_price"] = price
-        state["stop_loss"] = stop
+        state["entry_price"]   = price_idx
+        state["stop_loss"]     = stop_idx
+        state["stop_loss_etf"] = stop_etf
     elif decision == "VENDER":
         state["position_open"] = False
-        state["entry_price"] = None
-        state["stop_loss"] = None
+        state["entry_price"]   = None
+        state["stop_loss"]     = None
+        state["stop_loss_etf"] = None
     elif decision == "MANTENER":
-        state["stop_loss"] = stop  # trinquete actualizado
+        state["stop_loss"]     = stop_idx
+        state["stop_loss_etf"] = stop_etf
+
     save_state(state)
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    data_date = df.index[-1].strftime("%Y-%m-%d")
 
     return {
-        "timestamp": ts,
-        "data_date": data_date,
-        "ticker": ETF_TICKER,
-        "currency": CURRENCY,
-        "price": price,
-        "sma200": sma200,
-        "donchian_high": donchian_high,
-        "donchian_low": donchian_low,
-        "atr": atr,
-        "adx": adx,
-        "stop_loss": stop,
-        "decision": decision,
-        "reason": reason,
+        # — Meta —
+        "timestamp":     ts,
+        "decision":      decision,
+        "reason":        reason,
         "position_open": state["position_open"],
-        "entry_price": state.get("entry_price"),
+
+        # — Indice ETH-EUR —
+        "index": {
+            "ticker":        INDEX_TICKER,
+            "currency":      CURRENCY,
+            "data_date":     data_date_idx,
+            "price":         price_idx,
+            "sma200":        sma200,
+            "donchian_high": donchian_high,
+            "donchian_low":  donchian_low,
+            "atr":           atr,
+            "adx":           adx,
+            "stop_loss":     stop_idx,
+            "entry_price":   state.get("entry_price"),
+        },
+
+        # — ETF ETHC.DE —
+        "etf": {
+            "ticker":    ETF_TICKER,
+            "currency":  CURRENCY,
+            "data_date": fecha_etf,
+            "price":     precio_etf,
+            "stop_loss": stop_etf,
+            "ok":        etf_ok,
+        },
     }
 
 

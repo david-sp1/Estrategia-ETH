@@ -16,57 +16,97 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
-DAILY_HOUR = int(os.environ.get("DAILY_HOUR", "8"))   # hora UTC del informe diario
-TIMEZONE = os.environ.get("TIMEZONE", "Europe/Madrid")
+CHAT_ID        = os.environ["CHAT_ID"]
+DAILY_HOUR     = int(os.environ.get("DAILY_HOUR", "8"))
+TIMEZONE       = os.environ.get("TIMEZONE", "Europe/Madrid")
 
+
+# ── Formato del mensaje ───────────────────────────────────────────────────────
 
 def format_message(result: dict) -> str:
     decision_emoji = {
-        "COMPRAR": "🟢",
-        "VENDER": "🔴",
+        "COMPRAR":  "🟢",
+        "VENDER":   "🔴",
         "MANTENER": "🟡",
-        "ESPERAR": "⏳",
+        "ESPERAR":  "⏳",
     }.get(result["decision"], "❓")
 
-    adx_label = "💪 Fuerte" if result["adx"] > 25 else "😴 Lateral"
-    price_vs_sma = "📈 Por encima" if result["price"] > result["sma200"] else "📉 Por debajo"
-    cur = result.get("currency", "EUR")
-    ticker = result.get("ticker", "ETHC.DE")
-    data_date = result.get("data_date", "—")
+    idx = result["index"]
+    etf = result["etf"]
+    cur = idx["currency"]
 
-    lines = [
+    adx_label    = "💪 Fuerte" if idx["adx"] > 25 else "😴 Lateral"
+    price_vs_sma = "📈 Por encima" if idx["price"] > idx["sma200"] else "📉 Por debajo"
+
+    lines = []
+
+    # ── Cabecera ──────────────────────────────────────────────────────────────
+    lines += [
         f"━━━━━━━━━━━━━━━━━━━━━━",
-        f"📊 *{ticker} — Trend-Sustainer*",
+        f"📊 *Trend-Sustainer ETH*",
         f"🕐 {result['timestamp']}",
-        f"📅 Datos del cierre: `{data_date}`",
         f"━━━━━━━━━━━━━━━━━━━━━━",
         f"",
-        f"💰 *Precio ETF:* `{cur} {result['price']:,.4f}`",
-        f"📏 *SMA 200:* `{cur} {result['sma200']:,.4f}` — {price_vs_sma}",
-        f"📡 *Fuerza ADX:* `{result['adx']:.1f}` — {adx_label}",
-        f"🔼 *Donchian High:* `{cur} {result['donchian_high']:,.4f}`",
-        f"🔽 *Donchian Low:* `{cur} {result['donchian_low']:,.4f}`",
-        f"📉 *ATR 14:* `{cur} {result['atr']:,.4f}`",
+    ]
+
+    # ── Bloque 1: Índice ETH-EUR ───────────────────────────────────────────────
+    lines += [
+        f"📈 *{idx['ticker']} — Índice*",
+        f"📅 Cierre: `{idx['data_date']}`",
         f"",
+        f"💰 *Precio:*          `{cur} {idx['price']:,.2f}`",
+        f"📏 *SMA 200:*         `{cur} {idx['sma200']:,.2f}` — {price_vs_sma}",
+        f"📡 *ADX:*             `{idx['adx']:.1f}` — {adx_label}",
+        f"🔼 *Donchian High:*   `{cur} {idx['donchian_high']:,.2f}`",
+        f"🔽 *Donchian Low:*    `{cur} {idx['donchian_low']:,.2f}`",
+        f"📉 *ATR 14:*          `{cur} {idx['atr']:,.2f}`",
+        f"🛑 *Stop Loss idx:*   `{cur} {idx['stop_loss']:,.2f}`",
+    ]
+
+    if result["position_open"] and idx.get("entry_price"):
+        pnl_pct = ((idx["price"] - idx["entry_price"]) / idx["entry_price"]) * 100
+        pnl_emoji = "🤑" if pnl_pct > 0 else "😬"
+        lines += [
+            f"📌 *Entrada (índice):* `{cur} {idx['entry_price']:,.2f}`",
+            f"{pnl_emoji} *PnL no realizado:*  `{pnl_pct:+.2f}%`",
+        ]
+
+    lines.append("")
+
+    # ── Bloque 2: ETF ETHC.DE ─────────────────────────────────────────────────
+    lines.append(f"──────────────────────")
+    lines.append(f"📦 *{etf['ticker']} — ETF*")
+
+    if etf["ok"]:
+        lines += [
+            f"📅 Cierre: `{etf['data_date']}`",
+            f"💰 *Precio ETF:*      `{cur} {etf['price']:,.4f}`",
+            f"🛑 *Stop Loss ETF:*   `{cur} {etf['stop_loss']:,.4f}`",
+        ]
+    else:
+        stop_txt = (f"`{cur} {etf['stop_loss']:,.4f}` _(estimado)_"
+                    if etf["stop_loss"] else "—")
+        lines += [
+            f"⚠️ _Datos no disponibles en este momento_",
+            f"🛑 *Stop Loss ETF:*   {stop_txt}",
+        ]
+
+    lines.append("")
+
+    # ── Decisión ──────────────────────────────────────────────────────────────
+    lines += [
         f"━━━━━━━━━━━━━━━━━━━━━━",
         f"{decision_emoji} *DECISIÓN: {result['decision']}*",
         f"💬 *Por qué:* {result['reason']}",
-        f"🛑 *Stop Loss:* `{cur} {result['stop_loss']:,.4f}`",
         f"━━━━━━━━━━━━━━━━━━━━━━",
     ]
-
-    if result.get("position_open"):
-        lines.append(f"\n📌 *Posición abierta desde:* `{cur} {result['entry_price']:,.4f}`")
-        pnl_pct = ((result["price"] - result["entry_price"]) / result["entry_price"]) * 100
-        pnl_emoji = "🤑" if pnl_pct > 0 else "😬"
-        lines.append(f"{pnl_emoji} *PnL no realizado:* `{pnl_pct:+.2f}%`")
 
     return "\n".join(lines)
 
 
+# ── Handlers ──────────────────────────────────────────────────────────────────
+
 async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /estado — devuelve el análisis en el momento."""
     await update.message.reply_text("⏳ Analizando mercado, un momento...")
     try:
         result = await asyncio.to_thread(run_analysis)
@@ -86,8 +126,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 *ETH Trend-Sustainer Bot*\n\n"
         "Comandos disponibles:\n"
         "• /estado — análisis completo ahora mismo\n"
-        f"• Informe diario automático a las {DAILY_HOUR}:00 UTC\n\n"
-        "Usa /estado para empezar.",
+        f"• Informe diario automático a las {DAILY_HOUR}:00 {TIMEZONE}\n\n"
+        "Fuentes: ETH-EUR (índice) + ETHC.DE (ETF)",
         parse_mode="Markdown",
     )
 
@@ -97,31 +137,28 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
-    """Job que se ejecuta cada día a la hora configurada.
-    Se omite silenciosamente en fines de semana y festivos (mercado cerrado).
-    """
     logger.info("Ejecutando informe diario...")
     try:
         result = await asyncio.to_thread(run_analysis)
-        msg = "🌅 *Informe Diario — ETHC.DE*\n\n" + format_message(result)
+        msg = "🌅 *Informe Diario — Trend-Sustainer*\n\n" + format_message(result)
         await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
     except MercadoCerradoError as e:
-        # Fin de semana o festivo: no enviamos nada, solo log
         logger.info(f"Informe omitido: {e}")
     except Exception as e:
         logger.exception("Error en informe diario")
         await context.bot.send_message(chat_id=CHAT_ID, text=f"❌ Error en informe diario: {e}")
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("help",   cmd_help))
     app.add_handler(CommandHandler("estado", cmd_estado))
 
-    # Informe diario usando JobQueue
-    tz = pytz.timezone(TIMEZONE)
+    tz          = pytz.timezone(TIMEZONE)
     report_time = time(hour=DAILY_HOUR, minute=0, tzinfo=tz)
     app.job_queue.run_daily(daily_report, time=report_time, name="daily_report")
 
