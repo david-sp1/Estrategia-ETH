@@ -280,18 +280,18 @@ def run_all_assets() -> list[dict]:
     Los errores por activo individual se capturan y se incluyen en el resultado.
     """
     hoy = date.today()
-   # if hoy.weekday() >= 5:
-   #     nombre = "sábado" if hoy.weekday() == 5 else "domingo"
-   #     raise MercadoCerradoError(
-   #         f"Hoy es {nombre} ({hoy}). Los mercados no operan."
-    #    )
+    if hoy.weekday() >= 5:
+        nombre = "sábado" if hoy.weekday() == 5 else "domingo"
+        raise MercadoCerradoError(
+            f"Hoy es {nombre} ({hoy}). Los mercados no operan."
+       )
 
     results = []
     for asset in ASSETS:
         try:
             results.append(analyze_asset(asset))
-        #except MercadoCerradoError:
-         #   raise
+        except MercadoCerradoError:
+            raise
         except Exception as e:
             logger.error(f"Error analizando {asset['ticker']}: {e}")
             results.append({
