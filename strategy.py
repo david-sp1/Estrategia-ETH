@@ -9,7 +9,7 @@ Lógica:
   - Stop Loss: max(precio - ATR×3.5, Donchian_Low) con trinquete
   - ETH: indicadores sobre ETH-EUR, precio/stop traducido a ETHC.DE
 """
-
+import time
 import json
 import logging
 import os
@@ -106,7 +106,8 @@ def add_to_historial(entry: dict):
 def _download(ticker: str, period: str = "5y") -> pd.DataFrame:
     raw = yf.download(ticker, period=period, interval="1d",
                       auto_adjust=True, progress=False)
-    if raw.empty:
+  time.sleep(3)
+  if raw.empty:
         raise ValueError(f"Sin datos para {ticker}")
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
