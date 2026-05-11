@@ -103,17 +103,27 @@ def add_to_historial(entry: dict):
 
 # ── Descarga ──────────────────────────────────────────────────────────────────
 
-def _download(ticker: str, period: str = "5y") -> pd.DataFrame:
-    raw = yf.download(ticker, period=period, interval="1d",
-                      auto_adjust=True, progress=False)
-    if raw.empty:
-        raise ValueError(f"Sin datos para {ticker}")
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
-    df = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
-    df.columns = ["open", "high", "low", "close", "volume"]
-    df.index = pd.to_datetime(df.index, utc=True)
-    return df.dropna(subset=["close"])
+def _download(ticker: str, period: str = "5y", retries: int = 3) -> pd.DataFrame:
+    for attempt in range(retries):
+        try:
+            raw = yf.download(ticker, period=period, interval="1d",
+                              auto_adjust=True, progress=False)
+            if raw.empty:
+                raise ValueError(f"Sin datos para {ticker}")
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+            df = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
+            df.columns = ["open", "high", "low", "close", "volume"]
+            df.index = pd.to_datetime(df.index, utc=True)
+            return df.dropna(subset=["close"])
+        except Exception as e:
+            if "RateLimit" in str(e) or "Too Many" in str(e):
+                wait = 15 * (attempt + 1)  # 15s, 30s, 45s
+                logger.warning(f"[{ticker}] Rate limit, reintentando en {wait}s... (intento {attempt+1}/{retries})")
+                time.sleep(wait)
+            else:
+                raise
+    raise ValueError(f"Rate limit persistente para {ticker} tras {retries} intentos")
 
 
 def fetch_all_assets() -> dict[str, pd.DataFrame]:
@@ -128,7 +138,7 @@ def fetch_all_assets() -> dict[str, pd.DataFrame]:
     data = {}
     for i, asset in enumerate(ASSETS):
         if i > 0:
-            time.sleep(3)
+            time.sleep(8)  # pausa entre activos para evitar rate limiting
         ticker = asset["ticker"]
         try:
             data[ticker] = _download(ticker)
@@ -142,7 +152,7 @@ def fetch_all_assets() -> dict[str, pd.DataFrame]:
 def fetch_etf_price() -> dict | None:
     """Precio actual del ETF ETHC.DE."""
     try:
-        time.sleep(2)
+        time.sleep(8)
         df = _download(ETF_TICKER, period="1y")
         return {
             "precio": float(df["close"].iloc[-1]),
@@ -455,3 +465,4 @@ def run_analysis() -> dict:
 if __name__ == "__main__":
     import pprint
     pprint.pprint(run_analysis())
+ 
