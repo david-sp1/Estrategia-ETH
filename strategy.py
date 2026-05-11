@@ -47,7 +47,6 @@ ASSETS = [
     {"ticker": "ETH-EUR", "name": "Ethereum",  "currency": "EUR"},
     {"ticker": "NVDA",    "name": "NVIDIA",     "currency": "USD"},
     {"ticker": "GOOGL",   "name": "Alphabet",   "currency": "USD"},
-    {"ticker": "AAPL",    "name": "Apple",      "currency": "USD"},
     {"ticker": "MSFT",    "name": "Microsoft",  "currency": "USD"},
     {"ticker": "BTC-EUR", "name": "Bitcoin",    "currency": "EUR"},
 ]
