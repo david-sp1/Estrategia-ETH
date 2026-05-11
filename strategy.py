@@ -47,7 +47,6 @@ ASSETS = [
     {"ticker": "ETH-EUR", "name": "Ethereum",  "currency": "EUR"},
     {"ticker": "NVDA",    "name": "NVIDIA",     "currency": "USD"},
     {"ticker": "GOOGL",   "name": "Alphabet",   "currency": "USD"},
-    {"ticker": "AAPL",    "name": "Apple",      "currency": "USD"},
     {"ticker": "MSFT",    "name": "Microsoft",  "currency": "USD"},
     {"ticker": "BTC-EUR", "name": "Bitcoin",    "currency": "EUR"},
 ]
@@ -138,7 +137,7 @@ def fetch_all_assets() -> dict[str, pd.DataFrame]:
     data = {}
     for i, asset in enumerate(ASSETS):
         if i > 0:
-            time.sleep(8)  # pausa entre activos para evitar rate limiting
+            time.sleep(15)  # pausa entre activos para evitar rate limiting
         ticker = asset["ticker"]
         try:
             data[ticker] = _download(ticker)
