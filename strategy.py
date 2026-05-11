@@ -106,7 +106,7 @@ def add_to_historial(entry: dict):
 def _download(ticker: str, period: str = "5y") -> pd.DataFrame:
     raw = yf.download(ticker, period=period, interval="1d",
                       auto_adjust=True, progress=False)
-  if raw.empty:
+    if raw.empty:
         raise ValueError(f"Sin datos para {ticker}")
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
@@ -158,12 +158,23 @@ def fetch_etf_price() -> dict | None:
 def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["sma200"]        = ta.sma(df["close"], length=PERIODO_SMA)
+
     adx_df              = ta.adx(df["high"], df["low"], df["close"], length=PERIODO_ADX)
-    df["adx"]           = adx_df.iloc[:, 0]
+    # Columna ADX_14 en v0.4.x, primera columna en versiones anteriores
+    adx_col = "ADX_14" if "ADX_14" in adx_df.columns else adx_df.columns[0]
+    df["adx"]           = adx_df[adx_col]
+
     df["atr"]           = ta.atr(df["high"], df["low"], df["close"], length=PERIODO_ATR)
     df["don_high_prev"] = df["high"].rolling(PERIODO_DONCHIAN).max().shift(1)
     df["don_low"]       = df["low"].rolling(PERIODO_DONCHIAN).min()
-    df["roc20"]         = ta.roc(df["close"], length=PERIODO_ROC)
+
+    roc_result          = ta.roc(df["close"], length=PERIODO_ROC)
+    # roc puede devolver Series o DataFrame según versión
+    if isinstance(roc_result, pd.DataFrame):
+        df["roc20"] = roc_result.iloc[:, 0]
+    else:
+        df["roc20"] = roc_result
+
     return df
 
 
@@ -207,7 +218,9 @@ def run_analysis() -> dict:
         row = df.iloc[-1]
 
         # Saltar filas con NaN en indicadores clave
-        if pd.isna(row["sma200"]) or pd.isna(row["adx"]) or pd.isna(row["roc20"]):
+        key_cols = ["sma200", "adx", "atr", "don_high_prev", "don_low", "roc20"]
+        if any(pd.isna(row.get(c, float("nan"))) for c in key_cols):
+            logger.warning(f"[{ticker}] NaN en indicadores, saltando")
             continue
 
         price         = float(row["close"])
