@@ -11,6 +11,7 @@ Cada activo se define con:
 El estado de posición se guarda por activo en /data/state_<ticker>.json
 """
 
+import time
 import json
 import logging
 import os
