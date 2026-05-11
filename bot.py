@@ -7,7 +7,7 @@ import pytz
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from strategy import run_all_assets, MercadoCerradoError, ASSETS
+from strategy import run_analysis, MercadoCerradoError, ASSETS
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -20,192 +20,241 @@ CHAT_ID        = os.environ["CHAT_ID"]
 DAILY_HOUR     = int(os.environ.get("DAILY_HOUR", "8"))
 TIMEZONE       = os.environ.get("TIMEZONE", "Europe/Madrid")
 
-DECISION_EMOJI = {
-    "COMPRAR":  "🟢",
-    "VENDER":   "🔴",
-    "MANTENER": "🟡",
-    "ESPERAR":  "⏳",
-    "ERROR":    "❌",
-}
 
-# Orden de prioridad para mostrar activos
-ORDEN_DECISION = {"COMPRAR": 0, "VENDER": 1, "MANTENER": 2, "ESPERAR": 3, "ERROR": 4}
+# ── Helpers de formato ────────────────────────────────────────────────────────
+
+def _dec(price: float) -> int:
+    """Decimales según magnitud del precio."""
+    if price is None:
+        return 2
+    if price < 10:    return 4
+    if price < 1000:  return 2
+    return 0
 
 
-# ── Formato de un activo ──────────────────────────────────────────────────────
+def _fmt(value: float, decimals: int = None) -> str:
+    if value is None:
+        return "—"
+    d = decimals if decimals is not None else _dec(value)
+    return f"{value:,.{d}f}"
 
-def format_asset(r: dict) -> str:
-    if r["decision"] == "ERROR":
-        return (
-            f"🔷 *{r['name']} ({r['ticker']})*  ❌ *ERROR*\n"
-            f"⚠️ _{r.get('error', 'Error desconocido')}_"
-        )
 
-    emoji = DECISION_EMOJI[r["decision"]]
-    cur   = r["currency"]
-    dec   = 4 if r["price"] < 100 else 2
+def _pnl_emoji(pnl: float) -> str:
+    return "🤑" if pnl > 0 else ("😬" if pnl < 0 else "➖")
 
-    def fmt(v, d=None):
-        d = d or dec
-        return f"{v:,.{d}f}" if v is not None else "—"
 
-    adx_label    = "💪 Fuerte" if r["adx"] > 25 else "😴 Lateral"
-    price_vs_sma = "📈 Por encima" if r["price"] > r["sma200"] else "📉 Por debajo"
+# ── Bloque de posición activa (detalle completo) ──────────────────────────────
+
+def format_position(pos: dict, decision: str, etf: dict | None) -> str:
+    cur   = pos["currency"]
+    dec   = _dec(pos["price"])
+    emoji = {"COMPRAR": "🟢", "MANTENER": "🟡", "VENDER": "🔴", "ROTAR": "🔄"}.get(decision, "⏳")
+    adx_label    = "💪 Fuerte"  if pos["adx"]   > 25             else "😴 Lateral"
+    price_vs_sma = "📈 Por encima" if pos["price"] > pos["sma200"] else "📉 Por debajo"
+    pnl           = pos.get("pnl_pct", 0.0) or 0.0
 
     lines = [
-        f"🔷 *{r['name']} ({r['ticker']})*  {emoji} *{r['decision']}*",
-        f"📅 Cierre: `{r['data_date']}`",
+        f"🔷 *{pos['name']} ({pos['ticker']})*  {emoji} *{decision}*",
+        f"📅 Cierre: `{pos['data_date']}`",
         f"",
-        f"💰 Precio:        `{cur} {fmt(r['price'])}`",
-        f"📏 SMA 200:       `{cur} {fmt(r['sma200'])}` — {price_vs_sma}",
-        f"📡 ADX:           `{r['adx']:.1f}` — {adx_label}",
-        f"🔼 Donchian High: `{cur} {fmt(r['donchian_high'])}`",
-        f"🔽 Donchian Low:  `{cur} {fmt(r['donchian_low'])}`",
-        f"📉 ATR 14:        `{cur} {fmt(r['atr'])}`",
-        f"🛑 Stop Loss:     `{cur} {fmt(r['stop_loss'])}`",
+        f"💰 Precio:        {cur} `{_fmt(pos['price'], dec)}`",
+        f"📏 SMA 200:       {cur} `{_fmt(pos['sma200'], dec)}` — {price_vs_sma}",
+        f"📡 ADX:           `{pos['adx']:.1f}` — {adx_label}",
+        f"🔼 Donchian High: {cur} `{_fmt(pos['don_high'], dec)}`",
+        f"🔽 Donchian Low:  {cur} `{_fmt(pos['don_low'], dec)}`",
+        f"📉 ATR 14:        {cur} `{_fmt(pos['atr'], dec)}`",
+        f"🛑 Stop Loss:     {cur} `{_fmt(pos.get('stop_loss'), dec)}`",
+        f"",
+        f"📌 Entrada:       {cur} `{_fmt(pos.get('entry_price'), dec)}`",
+        f"{_pnl_emoji(pnl)} PnL:            `{pnl:+.2f}%`",
     ]
 
-    if r["position_open"] and r.get("entry_price"):
-        pnl_pct   = (r["price"] - r["entry_price"]) / r["entry_price"] * 100
-        pnl_emoji = "🤑" if pnl_pct > 0 else "😬"
+    # Bloque ETF si es ETH
+    if etf:
         lines += [
             f"",
-            f"📌 Entrada:       `{cur} {fmt(r['entry_price'])}`",
-            f"{pnl_emoji} PnL:            `{pnl_pct:+.2f}%`",
+            f"📦 *{etf['ticker']} — ETF*",
         ]
-
-    # Bloque ETF opcional
-    etf = r.get("etf")
-    if etf:
-        ecur = etf["currency"]
-        edec = 4 if (etf.get("price") or 0) < 100 else 2
-        lines.append(f"")
-        lines.append(f"📦 *{etf['ticker']} — ETF*")
         if etf["ok"]:
+            edec = _dec(etf["price"])
             lines += [
-                f"💰 Precio ETF:    `{ecur} {etf['price']:,.{edec}f}`",
-                f"🛑 Stop Loss ETF: `{ecur} {etf['stop_loss']:,.{edec}f}`",
+                f"💰 Precio ETF:    EUR `{_fmt(etf['price'], edec)}`",
+                f"📌 Entrada ETF:   EUR `{_fmt(etf.get('entry_price'), edec)}`",
+                f"🛑 Stop Loss ETF: EUR `{_fmt(etf['stop_loss'], edec)}`",
             ]
         else:
-            stop_txt = (f"`{ecur} {etf['stop_loss']:,.4f}` _(estimado)_"
-                        if etf.get("stop_loss") else "—")
             lines += [
                 f"⚠️ _Datos ETF no disponibles_",
-                f"🛑 Stop Loss ETF: {stop_txt}",
+                f"🛑 Stop Loss ETF: EUR `{_fmt(etf.get('stop_loss'), 4)}` _(estimado)_",
             ]
 
-    lines.append(f"")
-    lines.append(f"💬 _{r['reason']}_")
+    lines += [
+        f"",
+        f"💬 _{'Ruptura confirmada con fuerza de tendencia' if decision == 'COMPRAR' else 'Tendencia intacta' if decision == 'MANTENER' else 'Señal de salida activa'}_",
+    ]
+    return "\n".join(lines)
+
+
+# ── Bloque de salida (cuando se vende) ────────────────────────────────────────
+
+def format_salida(salida: dict) -> str:
+    cur  = salida["currency"]
+    dec  = _dec(salida["price"])
+    pnl  = salida.get("pnl_pct", 0.0)
+    tipo = salida.get("tipo", "VENTA")
+    emoji = "🤑" if pnl > 0 else "😬"
+
+    return "\n".join([
+        f"🔻 *Cierre de posición — {salida['name']} ({salida['ticker']})*",
+        f"📋 Tipo: _{tipo}_",
+        f"💰 Precio salida: {cur} `{_fmt(salida['price'], dec)}`",
+        f"📌 Precio entrada: {cur} `{_fmt(salida.get('entry_price'), dec)}`",
+        f"{emoji} PnL: `{pnl:+.2f}%`",
+    ])
+
+
+# ── Ranking de momentum ───────────────────────────────────────────────────────
+
+def format_ranking(ranking: list, pos_ticker: str | None) -> str:
+    lines = ["📊 *Ranking Momentum (ROC 20 días)*", ""]
+    for i, snap in enumerate(ranking, 1):
+        ticker = snap["ticker"]
+        roc    = snap["roc20"]
+        ok     = snap["condiciones_ok"]
+
+        if ticker == pos_ticker:
+            marker = "🟡 _(posición actual)_"
+        elif ok:
+            marker = "✅"
+        else:
+            reasons = []
+            if snap["price"] <= snap["sma200"]:
+                reasons.append("bajo SMA200")
+            if snap["adx"] <= 25:
+                reasons.append("ADX<25")
+            if not reasons:
+                reasons.append("sin ruptura")
+            marker = f"❌ {', '.join(reasons)}"
+
+        sign = "+" if roc >= 0 else ""
+        lines.append(f"`{i}.` *{snap['name']}* `{sign}{roc:.1f}%`  {marker}")
+
+    return "\n".join(lines)
+
+
+# ── Tabla historial ───────────────────────────────────────────────────────────
+
+def format_historial(historial: list) -> str:
+    if not historial:
+        return "📋 *Últimas operaciones*\n\n_Sin operaciones registradas aún_"
+
+    lines = ["📋 *Últimas 10 operaciones*", ""]
+    lines.append("`Fecha        Activo   Tipo               Precio      PnL`")
+    lines.append("`─────────────────────────────────────────────────────────`")
+
+    for h in reversed(historial[-10:]):
+        fecha   = h["fecha"][:10]
+        accion  = h["accion"].ljust(7)[:7]
+        tipo    = h["tipo"].ljust(18)[:18]
+        cur     = h.get("currency", "")
+        precio  = f"{cur} {h['precio']}"
+        ganancia = h["ganancia"]
+        lines.append(f"`{fecha}  {accion}  {tipo}  {precio:<12}  {ganancia}`")
+
     return "\n".join(lines)
 
 
 # ── Mensaje completo ──────────────────────────────────────────────────────────
 
-def format_full_report(results: list[dict], titulo: str) -> str:
+def format_report(result: dict, titulo: str) -> str:
     tz  = pytz.timezone(TIMEZONE)
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
-    # Ordenar: COMPRAR → VENDER → MANTENER → ESPERAR → ERROR
-    ordered = sorted(results, key=lambda r: ORDEN_DECISION.get(r["decision"], 9))
+    decision       = result["decision"]
+    decision_ticker = result.get("decision_ticker", "")
+    pos            = result.get("position")
+    salida         = result.get("salida")
+    ranking        = result.get("ranking", [])
+    etf            = result.get("etf")
+    historial      = result.get("historial", [])
 
     lines = [
         f"━━━━━━━━━━━━━━━━━━━━━━",
         f"📊 *{titulo}*",
         f"🕐 {now} · {TIMEZONE}",
         f"━━━━━━━━━━━━━━━━━━━━━━",
+        f"",
     ]
 
-    # Resumen de señales activas (COMPRAR y VENDER únicamente)
-    señales = [r for r in results if r["decision"] in ("COMPRAR", "VENDER")]
-    if señales:
-        lines += ["", "🚨 *SEÑALES ACTIVAS*", ""]
-        for r in sorted(señales, key=lambda r: ORDEN_DECISION[r["decision"]]):
-            emoji = DECISION_EMOJI[r["decision"]]
-            lines.append(f"{emoji} *{r['decision']}* — {r['name']} ({r['ticker']})")
-        lines.append("")
+    # ── Cabecera de señal ──────────────────────────────────────────────────────
+    if decision == "ROTAR":
+        lines += [
+            f"🚨 *SEÑAL ACTIVA*",
+            f"",
+            f"🔄 *ROTACIÓN* — `{decision_ticker}`",
+            f"",
+        ]
+    elif decision == "COMPRAR":
+        lines += [
+            f"🚨 *SEÑAL ACTIVA*",
+            f"",
+            f"🟢 *COMPRAR* — `{decision_ticker}`",
+            f"",
+        ]
+    elif decision == "VENDER":
+        lines += [
+            f"🚨 *SEÑAL ACTIVA*",
+            f"",
+            f"🔴 *VENDER* — `{decision_ticker}`",
+            f"",
+        ]
+    elif decision == "MANTENER":
+        lines += [
+            f"🟡 *MANTENER* — posición en `{decision_ticker}`",
+            f"",
+        ]
     else:
-        lines += ["", "✅ _Sin señales de compra o venta hoy_", ""]
+        lines += [
+            f"⏳ *Sin posición abierta — esperando señal*",
+            f"",
+        ]
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("")
 
-    # Detalle de cada activo
-    for i, r in enumerate(ordered):
-        lines.append("")
-        lines.append(format_asset(r))
-        if i < len(ordered) - 1:
-            lines += ["", "──────────────────────"]
+    # ── Posición que se cierra (en rotación o venta técnica) ──────────────────
+    if salida:
+        lines.append(format_salida(salida))
+        lines += ["", "──────────────────────", ""]
 
-    lines += ["", "━━━━━━━━━━━━━━━━━━━━━━"]
-    return "\n".join(lines)
+    # ── Posición activa ────────────────────────────────────────────────────────
+    if pos:
+        label = decision if decision in ("COMPRAR", "MANTENER", "ROTAR") else "MANTENER"
+        lines.append(format_position(pos, label, etf))
+        lines += ["", "━━━━━━━━━━━━━━━━━━━━━━", ""]
+    elif decision == "ESPERAR":
+        lines += ["_Sin posición abierta. Esperando condiciones de entrada._", "", "━━━━━━━━━━━━━━━━━━━━━━", ""]
 
+    # ── Ranking ────────────────────────────────────────────────────────────────
+    pos_ticker = pos["ticker"] if pos else None
+    lines.append(format_ranking(ranking, pos_ticker))
+    lines += ["", "━━━━━━━━━━━━━━━━━━━━━━", ""]
 
-def format_daily_report(results: list[dict]) -> str:
-    """
-    Informe diario: todos los activos, pero los que están en ESPERAR
-    se muestran en versión compacta para no saturar.
-    """
-    tz  = pytz.timezone(TIMEZONE)
-    now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
-
-    ordered = sorted(results, key=lambda r: ORDEN_DECISION.get(r["decision"], 9))
-
-    lines = [
-        f"━━━━━━━━━━━━━━━━━━━━━━",
-        f"🌅 *Informe Diario — Trend-Sustainer*",
-        f"🕐 {now} · {TIMEZONE}",
-        f"━━━━━━━━━━━━━━━━━━━━━━",
-    ]
-
-    # Resumen de señales activas
-    señales = [r for r in results if r["decision"] in ("COMPRAR", "VENDER")]
-    if señales:
-        lines += ["", "🚨 *SEÑALES ACTIVAS*", ""]
-        for r in sorted(señales, key=lambda r: ORDEN_DECISION[r["decision"]]):
-            emoji = DECISION_EMOJI[r["decision"]]
-            lines.append(f"{emoji} *{r['decision']}* — {r['name']} ({r['ticker']})")
-        lines.append("")
-    else:
-        lines += ["", "✅ _Sin señales de compra o venta hoy_", ""]
-
+    # ── Historial ──────────────────────────────────────────────────────────────
+    lines.append(format_historial(historial))
+    lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
 
-    # Activos con señal activa: bloque completo
-    activos = [r for r in ordered if r["decision"] != "ESPERAR"]
-    espera  = [r for r in ordered if r["decision"] == "ESPERAR"]
-
-    for i, r in enumerate(activos):
-        lines.append("")
-        lines.append(format_asset(r))
-        if i < len(activos) - 1:
-            lines += ["", "──────────────────────"]
-
-    # Activos en ESPERAR: versión compacta
-    if espera:
-        if activos:
-            lines += ["", "──────────────────────"]
-        lines += ["", "⏳ *En espera (sin condiciones de entrada)*", ""]
-        for r in espera:
-            cur = r["currency"]
-            dec = 4 if r["price"] < 100 else 2
-            adx_label = "💪" if r["adx"] > 25 else "😴"
-            vs_sma = "📈" if r["price"] > r["sma200"] else "📉"
-            lines.append(
-                f"• *{r['name']}* `{cur} {r['price']:,.{dec}f}` "
-                f"SMA {vs_sma}  ADX {r['adx']:.0f} {adx_label}"
-            )
-
-    lines += ["", "━━━━━━━━━━━━━━━━━━━━━━"]
     return "\n".join(lines)
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/estado — informe completo de todos los activos."""
-    await update.message.reply_text("⏳ Analizando todos los activos...")
+    await update.message.reply_text("⏳ Analizando mercado...")
     try:
-        results = await asyncio.to_thread(run_all_assets)
-        msg = format_full_report(results, "Trend-Sustainer — Estado actual")
+        result = await asyncio.to_thread(run_analysis)
+        msg = format_report(result, "Trend-Sustainer Rotacional")
         await update.message.reply_text(msg, parse_mode="Markdown")
     except MercadoCerradoError as e:
         await update.message.reply_text(
@@ -213,18 +262,23 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     except Exception as e:
-        logger.exception("Error en /estado")
-        await update.message.reply_text(f"❌ Error: {e}")
+        import traceback
+        tb = traceback.format_exc()
+        logger.error(f"Error en /estado:\n{tb}")
+        await update.message.reply_text(
+            f"❌ Error:\n<pre>{tb[-1000:]}</pre>",
+            parse_mode="HTML"
+        )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     activos = ", ".join(f"{a['name']} ({a['ticker']})" for a in ASSETS)
     await update.message.reply_text(
-        f"👋 *Trend-Sustainer Bot*\n\n"
-        f"Activos monitorizados:\n{activos}\n\n"
+        f"👋 *Trend-Sustainer Rotacional*\n\n"
+        f"Activos: {activos}\n\n"
         f"Comandos:\n"
         f"• /estado — análisis completo ahora mismo\n"
-        f"• Informe diario automático a las {DAILY_HOUR}:00 ({TIMEZONE})",
+        f"• Informe diario a las {DAILY_HOUR}:00 ({TIMEZONE})",
         parse_mode="Markdown",
     )
 
@@ -236,15 +290,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Ejecutando informe diario...")
     try:
-        results = await asyncio.to_thread(run_all_assets)
-        msg = format_daily_report(results)
+        result = await asyncio.to_thread(run_analysis)
+        msg = format_report(result, "Informe Diario — Trend-Sustainer")
         await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
     except MercadoCerradoError as e:
         logger.info(f"Informe omitido: {e}")
     except Exception as e:
-        logger.exception("Error en informe diario")
+        import traceback
+        tb = traceback.format_exc()
+        logger.error(f"Error en informe diario:\n{tb}")
         await context.bot.send_message(
-            chat_id=CHAT_ID, text=f"❌ Error en informe diario: {e}"
+            chat_id=CHAT_ID,
+            text=f"❌ Error en informe diario:\n<pre>{tb[-1000:]}</pre>",
+            parse_mode="HTML"
         )
 
 
@@ -252,7 +310,6 @@ async def daily_report(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("help",   cmd_help))
     app.add_handler(CommandHandler("estado", cmd_estado))
@@ -261,7 +318,7 @@ def main():
     report_time = time(hour=DAILY_HOUR, minute=0, tzinfo=tz)
     app.job_queue.run_daily(daily_report, time=report_time, name="daily_report")
 
-    logger.info(f"Bot iniciado. Activos: {[a['ticker'] for a in ASSETS]}")
+    logger.info(f"Bot iniciado — {[a['ticker'] for a in ASSETS]}")
     app.run_polling(drop_pending_updates=True)
 
 
