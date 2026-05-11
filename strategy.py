@@ -47,6 +47,7 @@ ASSETS = [
     {"ticker": "ETH-EUR", "name": "Ethereum",  "currency": "EUR"},
     {"ticker": "NVDA",    "name": "NVIDIA",     "currency": "USD"},
     {"ticker": "GOOGL",   "name": "Alphabet",   "currency": "USD"},
+    {"ticker": "AAPL",    "name": "Apple",      "currency": "USD"},
     {"ticker": "MSFT",    "name": "Microsoft",  "currency": "USD"},
     {"ticker": "BTC-EUR", "name": "Bitcoin",    "currency": "EUR"},
 ]
@@ -151,7 +152,7 @@ def fetch_all_assets() -> dict[str, pd.DataFrame]:
 def fetch_etf_price() -> dict | None:
     """Precio actual del ETF ETHC.DE."""
     try:
-        time.sleep(8)
+        time.sleep(15)
         df = _download(ETF_TICKER, period="1y")
         return {
             "precio": float(df["close"].iloc[-1]),
@@ -245,7 +246,7 @@ def run_analysis() -> dict:
         condiciones_ok = (
             price > sma200 * (1 + BUFFER_SMA) and
             adx   > UMBRAL_ADX and
-            float(row["high"]) >= don_high_prev
+            price >= don_high_prev        # cierre >= máximo Donchian del día anterior
         )
 
         snapshots[ticker] = {
@@ -464,4 +465,3 @@ def run_analysis() -> dict:
 if __name__ == "__main__":
     import pprint
     pprint.pprint(run_analysis())
- 
