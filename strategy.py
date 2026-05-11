@@ -49,6 +49,14 @@ ASSETS = [
         "etf_ticker":   None,   # sin ETF asociado
         "etf_currency": None,
     },
+{
+        "ticker":   "GOOGL",
+        "currency": "USD",
+        "name":     "ALPHABET",
+        "etf_ticker":   None,   # sin ETF asociado
+        "etf_currency": None,
+    },
+  
 ]
 
 
