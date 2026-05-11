@@ -1,74 +1,107 @@
 """
-Estrategia "Trend-Sustainer" — multi-activo
+Estrategia "Trend-Sustainer" — Sistema Rotacional
 
-Cada activo se define con:
-  - ticker      : símbolo Yahoo Finance para indicadores (ETH-EUR, NVDA...)
-  - currency    : moneda de cotización (EUR, USD...)
-  - etf_ticker  : ticker secundario opcional (ej. ETHC.DE) para precio/stop del ETF
-  - etf_currency: moneda del ETF (normalmente igual que currency)
-  - name        : nombre legible
-
-El estado de posición se guarda por activo en /data/state_<ticker>.json
+Lógica:
+  - Solo una posición abierta a la vez
+  - Entra en el activo con mayor momentum ROC(20) que cumpla las 3 condiciones
+  - Rota si otro activo tiene momentum >15% superior al actual
+  - Sale si Close < Stop Loss o Close < SMA200 × (1 - buffer)
+  - Stop Loss: max(precio - ATR×3.5, Donchian_Low) con trinquete
+  - ETH: indicadores sobre ETH-EUR, precio/stop traducido a ETHC.DE
 """
 
-import time
 import json
 import logging
 import os
 import re
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import pandas_ta as ta
+
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
-# ── Parámetros de la estrategia ───────────────────────────────────────────────
+# ── Parámetros ────────────────────────────────────────────────────────────────
 PERIODO_DONCHIAN   = 50
 PERIODO_SMA        = 200
 PERIODO_ADX        = 14
+PERIODO_ATR        = 14
+PERIODO_ROC        = 20
 MULTIPLICADOR_ATR  = 3.5
-UMBRAL_ADX_ENTRADA = 25
+UMBRAL_ADX         = 25
+BUFFER_SMA         = 0.02   # 2% — precio debe estar 2% sobre/bajo SMA para señal
+UMBRAL_ROTACION    = 0.15   # 15% — momentum del candidato debe superar al actual en 15%
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+ETF_TICKER   = os.environ.get("ETF_TICKER",   "ETHC.DE")
+ETH_TICKER   = "ETH-EUR"
+DATA_DIR     = Path(os.environ.get("DATA_DIR", "/data"))
+STATE_FILE   = DATA_DIR / "state_rotacional.json"
+HISTORIAL_FILE = DATA_DIR / "historial.json"
 
 # ── Catálogo de activos ───────────────────────────────────────────────────────
-# Añade aquí nuevos activos sin tocar ningún otro fichero.
 ASSETS = [
-    {
-        "ticker":       "ETH-EUR",
-        "currency":     "EUR",
-        "name":         "Ethereum",
-        "etf_ticker":   os.environ.get("ETF_TICKER", "ETHC.DE"),
-        "etf_currency": "EUR",
-    },
-    {
-        "ticker":   "NVDA",
-        "currency": "USD",
-        "name":     "NVIDIA",
-        "etf_ticker":   None,   # sin ETF asociado
-        "etf_currency": None,
-    },
-{
-        "ticker":   "GOOGL",
-        "currency": "USD",
-        "name":     "ALPHABET",
-        "etf_ticker":   None,   # sin ETF asociado
-        "etf_currency": None,
-    },
-  
+    {"ticker": "ETH-EUR", "name": "Ethereum",  "currency": "EUR"},
+    {"ticker": "NVDA",    "name": "NVIDIA",     "currency": "USD"},
+    {"ticker": "GOOGL",   "name": "Alphabet",   "currency": "USD"},
+    {"ticker": "AAPL",    "name": "Apple",      "currency": "USD"},
+    {"ticker": "MSFT",    "name": "Microsoft",  "currency": "USD"},
+    {"ticker": "BTC-EUR", "name": "Bitcoin",    "currency": "EUR"},
 ]
 
 
 # ── Excepciones ───────────────────────────────────────────────────────────────
 
 class MercadoCerradoError(Exception):
-    """Fin de semana: mercados de valores cerrados."""
     pass
 
 
-# ── Descarga de datos ─────────────────────────────────────────────────────────
+# ── Persistencia ──────────────────────────────────────────────────────────────
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {
+        "position_open": False,
+        "ticker":        None,
+        "name":          None,
+        "currency":      None,
+        "entry_price":   None,
+        "stop_loss":     None,
+        "etf_ratio":     None,
+    }
+
+
+def save_state(state: dict):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def load_historial() -> list:
+    if HISTORIAL_FILE.exists():
+        with open(HISTORIAL_FILE) as f:
+            return json.load(f)
+    return []
+
+
+def save_historial(historial: list):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(HISTORIAL_FILE, "w") as f:
+        json.dump(historial[-100:], f, indent=2)  # guardamos últimas 100
+
+
+def add_to_historial(entry: dict):
+    h = load_historial()
+    h.append(entry)
+    save_historial(h)
+
+
+# ── Descarga ──────────────────────────────────────────────────────────────────
 
 def _download(ticker: str, period: str = "5y") -> pd.DataFrame:
     raw = yf.download(ticker, period=period, interval="1d",
@@ -83,239 +116,329 @@ def _download(ticker: str, period: str = "5y") -> pd.DataFrame:
     return df.dropna(subset=["close"])
 
 
-def fetch_ohlcv(ticker: str, period: str = "5y") -> pd.DataFrame:
-    """Descarga datos. Lanza MercadoCerradoError en fin de semana."""
+def fetch_all_assets() -> dict[str, pd.DataFrame]:
+    """Descarga todos los activos con pausa entre peticiones."""
     hoy = date.today()
     if hoy.weekday() >= 5:
         nombre = "sábado" if hoy.weekday() == 5 else "domingo"
         raise MercadoCerradoError(
             f"Hoy es {nombre} ({hoy}). Los mercados no operan."
         )
-    df = _download(ticker, period)
-    logger.info(f"[{ticker}] {df.index[-1].date()} | cierre: {df['close'].iloc[-1]:,.4f}")
-    return df
+
+    data = {}
+    for i, asset in enumerate(ASSETS):
+        if i > 0:
+            time.sleep(3)
+        ticker = asset["ticker"]
+        try:
+            data[ticker] = _download(ticker)
+            logger.info(f"[{ticker}] OK — cierre: {data[ticker]['close'].iloc[-1]:,.4f}")
+        except Exception as e:
+            logger.error(f"[{ticker}] Error descargando: {e}")
+
+    return data
 
 
-def fetch_etf_price(etf_ticker: str) -> dict | None:
-    """Precio del ETF secundario. Devuelve None si falla."""
+def fetch_etf_price() -> dict | None:
+    """Precio actual del ETF ETHC.DE."""
     try:
-        df = _download(etf_ticker, period="1y")
+        time.sleep(2)
+        df = _download(ETF_TICKER, period="1y")
         return {
             "precio": float(df["close"].iloc[-1]),
             "fecha":  df.index[-1].strftime("%Y-%m-%d"),
         }
     except Exception as e:
-        logger.warning(f"[{etf_ticker}] No disponible: {e}")
+        logger.warning(f"[{ETF_TICKER}] No disponible: {e}")
         return None
 
 
 # ── Indicadores ───────────────────────────────────────────────────────────────
 
-def calc_sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period).mean()
-
-
-def calc_donchian(high: pd.Series, low: pd.Series, period: int):
-    return high.rolling(period).max(), low.rolling(period).min()
-
-
-def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    tr = pd.concat([
-        high - low,
-        (high - close.shift(1)).abs(),
-        (low  - close.shift(1)).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(span=period, adjust=False).mean()
-
-
-def calc_adx(df: pd.DataFrame, period: int) -> pd.Series:
-    high, low = df["high"], df["low"]
-    plus_dm  = high - high.shift(1)
-    minus_dm = low.shift(1) - low
-    plus_dm  = plus_dm.where( (plus_dm  > minus_dm) & (plus_dm  > 0), 0.0)
-    minus_dm = minus_dm.where((minus_dm > plus_dm)  & (minus_dm > 0), 0.0)
-    atr      = calc_atr(df, period)
-    plus_di  = 100 * (plus_dm.ewm( span=period, adjust=False).mean() / atr)
-    minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / atr)
-    dx       = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).fillna(0)
-    return dx.ewm(span=period, adjust=False).mean()
-
-
-# ── Estado persistente por activo ─────────────────────────────────────────────
-
-def _state_path(ticker: str) -> Path:
-    safe = re.sub(r"[^\w\-]", "_", ticker)
-    return DATA_DIR / f"state_{safe}.json"
-
-
-def load_state(ticker: str) -> dict:
-    p = _state_path(ticker)
-    if p.exists():
-        with open(p) as f:
-            return json.load(f)
-    return {"position_open": False, "entry_price": None,
-            "stop_loss": None, "etf_ratio": None}
-
-
-def save_state(ticker: str, state: dict):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(_state_path(ticker), "w") as f:
-        json.dump(state, f, indent=2)
+def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["sma200"]        = ta.sma(df["close"], length=PERIODO_SMA)
+    adx_df              = ta.adx(df["high"], df["low"], df["close"], length=PERIODO_ADX)
+    df["adx"]           = adx_df.iloc[:, 0]
+    df["atr"]           = ta.atr(df["high"], df["low"], df["close"], length=PERIODO_ATR)
+    df["don_high_prev"] = df["high"].rolling(PERIODO_DONCHIAN).max().shift(1)
+    df["don_low"]       = df["low"].rolling(PERIODO_DONCHIAN).min()
+    df["roc20"]         = ta.roc(df["close"], length=PERIODO_ROC)
+    return df
 
 
 # ── Stop Loss ─────────────────────────────────────────────────────────────────
 
-def calc_stop(price: float, atr: float, donchian_low: float,
+def calc_stop(price: float, atr: float, don_low: float,
               prev_stop: float | None) -> float:
-    stop = max(price - atr * MULTIPLICADOR_ATR, donchian_low)
+    stop = max(price - atr * MULTIPLICADOR_ATR, don_low)
     if prev_stop is not None and stop < prev_stop:
         return prev_stop
     return stop
 
 
-# ── Motor de decisión ─────────────────────────────────────────────────────────
+# ── Análisis principal ────────────────────────────────────────────────────────
 
-def decide(price: float, sma200: float, adx: float,
-           donchian_high_prev: float, state: dict) -> tuple[str, str]:
+def run_analysis() -> dict:
+    # 1. Descargar todos los activos
+    data_raw = fetch_all_assets()
+
+    # 2. Calcular indicadores
+    data = {}
+    for ticker, df in data_raw.items():
+        try:
+            data[ticker] = calc_indicators(df)
+        except Exception as e:
+            logger.error(f"[{ticker}] Error calculando indicadores: {e}")
+
+    if not data:
+        raise ValueError("No se pudieron calcular indicadores para ningún activo")
+
+    # 3. Estado actual
+    state = load_state()
+
+    # 4. Construir snapshot de cada activo en la última fecha disponible
+    snapshots = {}
+    for asset in ASSETS:
+        ticker = asset["ticker"]
+        if ticker not in data:
+            continue
+        df  = data[ticker]
+        row = df.iloc[-1]
+
+        # Saltar filas con NaN en indicadores clave
+        if pd.isna(row["sma200"]) or pd.isna(row["adx"]) or pd.isna(row["roc20"]):
+            continue
+
+        price         = float(row["close"])
+        sma200        = float(row["sma200"])
+        adx           = float(row["adx"])
+        atr           = float(row["atr"])
+        don_high_prev = float(row["don_high_prev"]) if not pd.isna(row["don_high_prev"]) else price
+        don_low       = float(row["don_low"])
+        roc20         = float(row["roc20"])
+        data_date     = df.index[-1].strftime("%Y-%m-%d")
+        don_high      = float(df["high"].rolling(PERIODO_DONCHIAN).max().iloc[-1])
+
+        condiciones_ok = (
+            price > sma200 * (1 + BUFFER_SMA) and
+            adx   > UMBRAL_ADX and
+            float(row["high"]) >= don_high_prev
+        )
+
+        snapshots[ticker] = {
+            "ticker":        ticker,
+            "name":          asset["name"],
+            "currency":      asset["currency"],
+            "data_date":     data_date,
+            "price":         price,
+            "sma200":        sma200,
+            "adx":           adx,
+            "atr":           atr,
+            "don_high":      don_high,
+            "don_low":       don_low,
+            "roc20":         roc20,
+            "condiciones_ok": condiciones_ok,
+        }
+
+    # 5. Ranking por momentum
+    ranking = sorted(
+        snapshots.values(),
+        key=lambda x: x["roc20"],
+        reverse=True
+    )
+
+    # 6. Lógica rotacional
+    decision       = "ESPERAR"
+    decision_ticker = None
+    tipo_operacion  = None
+    candidato       = None   # activo candidato a entrar
+    salida_info     = None   # info del activo que se vende
+
+    # Candidato con más momentum que cumple condiciones
+    for snap in ranking:
+        if snap["condiciones_ok"]:
+            candidato = snap
+            break
+
+    if state["position_open"]:
+        t_inv    = state["ticker"]
+        snap_inv = snapshots.get(t_inv)
+
+        if snap_inv:
+            # Actualizar stop con trinquete
+            nuevo_stop = calc_stop(
+                snap_inv["price"], snap_inv["atr"],
+                snap_inv["don_low"], state["stop_loss"]
+            )
+            state["stop_loss"] = nuevo_stop
+
+            mom_actual = snap_inv["roc20"]
+            price_inv  = snap_inv["price"]
+
+            # Condición de salida técnica
+            salida_tecnica = (
+                price_inv < snap_inv["sma200"] * (1 - BUFFER_SMA) or
+                price_inv < state["stop_loss"]
+            )
+
+            # Condición de rotación
+            debe_rotar = (
+                candidato is not None and
+                candidato["ticker"] != t_inv and
+                candidato["roc20"] > mom_actual * (1 + UMBRAL_ROTACION)
+            )
+
+            if salida_tecnica or debe_rotar:
+                tipo_operacion = "VENTA ROTACIÓN" if debe_rotar else "VENTA TÉCNICA"
+                pnl_pct = (price_inv / state["entry_price"] - 1) * 100
+
+                salida_info = {
+                    **snap_inv,
+                    "stop_loss":   state["stop_loss"],
+                    "entry_price": state["entry_price"],
+                    "pnl_pct":     round(pnl_pct, 2),
+                    "tipo":        tipo_operacion,
+                }
+
+                add_to_historial({
+                    "fecha":     snap_inv["data_date"],
+                    "accion":    t_inv,
+                    "nombre":    state["name"],
+                    "tipo":      tipo_operacion,
+                    "precio":    round(price_inv, 4),
+                    "ganancia":  f"{pnl_pct:+.2f}%",
+                    "currency":  state["currency"],
+                })
+
+                state["position_open"] = False
+                state["ticker"]        = None
+                state["entry_price"]   = None
+                state["stop_loss"]     = None
+
+                decision = "VENDER"
+                decision_ticker = t_inv
+
+                # Si es rotación, entramos en el candidato
+                if debe_rotar and candidato:
+                    stop_nuevo = calc_stop(
+                        candidato["price"], candidato["atr"],
+                        candidato["don_low"], None
+                    )
+                    state["position_open"] = True
+                    state["ticker"]        = candidato["ticker"]
+                    state["name"]          = candidato["name"]
+                    state["currency"]      = candidato["currency"]
+                    state["entry_price"]   = candidato["price"]
+                    state["stop_loss"]     = stop_nuevo
+
+                    add_to_historial({
+                        "fecha":    candidato["data_date"],
+                        "accion":   candidato["ticker"],
+                        "nombre":   candidato["name"],
+                        "tipo":     "COMPRA",
+                        "precio":   round(candidato["price"], 4),
+                        "ganancia": "—",
+                        "currency": candidato["currency"],
+                    })
+
+                    decision        = "ROTAR"
+                    decision_ticker = f"{t_inv} → {candidato['ticker']}"
+
+            else:
+                # Mantener posición
+                decision        = "MANTENER"
+                decision_ticker = t_inv
+
+        else:
+            # Activo en posición ya no tiene datos, cerramos
+            state["position_open"] = False
+            state["stop_loss"]     = None
+
     if not state["position_open"]:
-        if price > sma200 and adx > UMBRAL_ADX_ENTRADA and price >= donchian_high_prev:
-            return "COMPRAR", "Ruptura confirmada con fuerza de tendencia"
-        return "ESPERAR", "Mercado sin condiciones de entrada"
-    else:
-        if price < sma200 or price < state["stop_loss"]:
-            return "VENDER", "Ruptura de soporte crítico o media de largo plazo"
-        return "MANTENER", "Tendencia intacta o mercado lateral dentro de límites"
+        if candidato:
+            stop_nuevo = calc_stop(
+                candidato["price"], candidato["atr"],
+                candidato["don_low"], None
+            )
+            state["position_open"] = True
+            state["ticker"]        = candidato["ticker"]
+            state["name"]          = candidato["name"]
+            state["currency"]      = candidato["currency"]
+            state["entry_price"]   = candidato["price"]
+            state["stop_loss"]     = stop_nuevo
 
+            add_to_historial({
+                "fecha":    candidato["data_date"],
+                "accion":   candidato["ticker"],
+                "nombre":   candidato["name"],
+                "tipo":     "COMPRA",
+                "precio":   round(candidato["price"], 4),
+                "ganancia": "—",
+                "currency": candidato["currency"],
+            })
 
-# ── Análisis de un activo ─────────────────────────────────────────────────────
+            decision        = "COMPRAR"
+            decision_ticker = candidato["ticker"]
+        else:
+            decision        = "ESPERAR"
+            decision_ticker = None
 
-def analyze_asset(asset: dict) -> dict:
-    """
-    Ejecuta la estrategia sobre un activo.
-    Devuelve un dict con todos los datos listos para formatear.
-    Puede lanzar MercadoCerradoError o ValueError.
-    """
-    ticker   = asset["ticker"]
-    currency = asset["currency"]
-    name     = asset["name"]
+    # 7. Stop loss del activo en posición (con ETF si es ETH)
+    pos_snap = snapshots.get(state["ticker"]) if state["position_open"] else None
 
-    # Indicadores
-    df = fetch_ohlcv(ticker)
-    df["sma200"]                           = calc_sma(df["close"], PERIODO_SMA)
-    df["donchian_high"], df["donchian_low"] = calc_donchian(df["high"], df["low"], PERIODO_DONCHIAN)
-    df["atr"] = calc_atr(df, PERIODO_ADX)
-    df["adx"] = calc_adx(df, PERIODO_ADX)
+    if pos_snap:
+        pos_snap["stop_loss"]   = state["stop_loss"]
+        pos_snap["entry_price"] = state["entry_price"]
+        if pos_snap["price"] and state["entry_price"]:
+            pos_snap["pnl_pct"] = round(
+                (pos_snap["price"] / state["entry_price"] - 1) * 100, 2
+            )
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    price         = float(last["close"])
-    sma200        = float(last["sma200"])
-    don_high      = float(last["donchian_high"])
-    don_low       = float(last["donchian_low"])
-    don_high_prev = float(prev["donchian_high"])
-    atr           = float(last["atr"])
-    adx           = float(last["adx"])
-    data_date     = df.index[-1].strftime("%Y-%m-%d")
-
-    # Estado y decisión
-    state     = load_state(ticker)
-    prev_stop = state.get("stop_loss")
-    stop      = calc_stop(price, atr, don_low, prev_stop)
-    decision, reason = decide(price, sma200, adx, don_high_prev, state)
-
-    # ETF secundario (opcional)
+    # 8. ETF (solo relevante cuando la posición es ETH-EUR)
     etf_result = None
-    if asset.get("etf_ticker"):
-        time.sleep (3)
-        etf_data = fetch_etf_price(asset["etf_ticker"])
-        if etf_data:
-            ratio     = etf_data["precio"] / price
-            stop_etf  = stop * ratio
+    if state["position_open"] and state["ticker"] == ETH_TICKER:
+        etf_data = fetch_etf_price()
+        eth_price = pos_snap["price"] if pos_snap else None
+
+        if etf_data and eth_price:
+            ratio = etf_data["precio"] / eth_price
             state["etf_ratio"] = ratio
             etf_result = {
-                "ticker":    asset["etf_ticker"],
-                "currency":  asset["etf_currency"],
+                "ticker":    ETF_TICKER,
                 "price":     etf_data["precio"],
                 "data_date": etf_data["fecha"],
-                "stop_loss": round(stop_etf, 4),
+                "stop_loss": round(state["stop_loss"] * ratio, 4),
+                "entry_price": round(state["entry_price"] * ratio, 4) if state["entry_price"] else None,
                 "ok":        True,
             }
         else:
             last_ratio = state.get("etf_ratio")
             etf_result = {
-                "ticker":    asset["etf_ticker"],
-                "currency":  asset["etf_currency"],
+                "ticker":    ETF_TICKER,
                 "price":     None,
                 "data_date": None,
-                "stop_loss": round(stop * last_ratio, 4) if last_ratio else None,
+                "stop_loss": round(state["stop_loss"] * last_ratio, 4) if last_ratio and state["stop_loss"] else None,
+                "entry_price": round(state["entry_price"] * last_ratio, 4) if last_ratio and state["entry_price"] else None,
                 "ok":        False,
             }
 
-    # Actualizar estado
-    if decision == "COMPRAR":
-        state.update({"position_open": True, "entry_price": price, "stop_loss": stop})
-    elif decision == "VENDER":
-        state.update({"position_open": False, "entry_price": None, "stop_loss": None})
-    elif decision == "MANTENER":
-        state["stop_loss"] = stop
-    save_state(ticker, state)
+    save_state(state)
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     return {
-        "ticker":        ticker,
-        "name":          name,
-        "currency":      currency,
-        "timestamp":     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "data_date":     data_date,
-        "decision":      decision,
-        "reason":        reason,
-        "position_open": state["position_open"],
-        "price":         price,
-        "sma200":        sma200,
-        "donchian_high": don_high,
-        "donchian_low":  don_low,
-        "atr":           atr,
-        "adx":           adx,
-        "stop_loss":     stop,
-        "entry_price":   state.get("entry_price"),
-        "etf":           etf_result,   # None si no hay ETF configurado
+        "timestamp":       ts,
+        "decision":        decision,
+        "decision_ticker": decision_ticker,
+        "position":        pos_snap,
+        "salida":          salida_info,
+        "ranking":         ranking,
+        "etf":             etf_result,
+        "historial":       load_historial()[-10:],
     }
-
-
-def run_all_assets() -> list[dict]:
-    """
-    Analiza todos los activos del catálogo.
-    Lanza MercadoCerradoError si es fin de semana (antes de cualquier descarga).
-    Los errores por activo individual se capturan y se incluyen en el resultado.
-    """
-    hoy = date.today()
-    if hoy.weekday() >= 5:
-        nombre = "sábado" if hoy.weekday() == 5 else "domingo"
-        raise MercadoCerradoError(
-            f"Hoy es {nombre} ({hoy}). Los mercados no operan."
-       )
-
-    results = []
-    for asset in ASSETS:
-        time.sleep (3)
-        try:
-            results.append(analyze_asset(asset))
-        except MercadoCerradoError:
-            raise
-        except Exception as e:
-            logger.error(f"Error analizando {asset['ticker']}: {e}")
-            results.append({
-                "ticker":   asset["ticker"],
-                "name":     asset["name"],
-                "error":    str(e),
-                "decision": "ERROR",
-            })
-    return results
 
 
 if __name__ == "__main__":
     import pprint
-    for r in run_all_assets():
-        pprint.pprint(r)
-        print()
+    pprint.pprint(run_analysis())
