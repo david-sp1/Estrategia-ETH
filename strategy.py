@@ -227,6 +227,7 @@ def analyze_asset(asset: dict) -> dict:
     # ETF secundario (opcional)
     etf_result = None
     if asset.get("etf_ticker"):
+        time.sleep (3)
         etf_data = fetch_etf_price(asset["etf_ticker"])
         if etf_data:
             ratio     = etf_data["precio"] / price
@@ -296,6 +297,7 @@ def run_all_assets() -> list[dict]:
 
     results = []
     for asset in ASSETS:
+        time.sleep (3)
         try:
             results.append(analyze_asset(asset))
         except MercadoCerradoError:
