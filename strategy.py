@@ -8,12 +8,21 @@ Lógica:
   - Sale si Close < Stop Loss o Close < SMA200 × (1 - buffer)
   - Stop Loss: max(precio - ATR×3.5, Donchian_Low) con trinquete
   - ETH: indicadores sobre ETH-EUR, precio/stop traducido a ETHC.DE
+
+Comandos CLI:
+  python strategy.py                        → ejecuta el análisis
+  python strategy.py /help                  → muestra esta ayuda
+  python strategy.py /reset                 → resetea el estado y el historial
+  python strategy.py /add <TICKER> <PRECIO_ENTRADA> [STOP_LOSS]
+                                            → inicializa una posición ya comprada
 """
 
+import argparse
 import json
 import logging
 import os
 import re
+import sys
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -34,7 +43,7 @@ PERIODO_ROC        = 20
 MULTIPLICADOR_ATR  = 3.5
 UMBRAL_ADX         = 25
 BUFFER_SMA         = 0.02   # 2% — precio debe estar 2% sobre/bajo SMA para señal
-UMBRAL_ROTACION    = 0.15   # 15% — momentum del candidato debe superar al actual en 15%
+UMBRAL_ROTACION    = 0.2   # 20% — momentum del candidato debe superar al actual en 20%
 
 ETF_TICKER   = os.environ.get("ETF_TICKER",   "ETHC.DE")
 ETH_TICKER   = "ETH-EUR"
@@ -50,6 +59,9 @@ ASSETS = [
     {"ticker": "MSFT",    "name": "Microsoft",  "currency": "USD"},
     {"ticker": "BTC-EUR", "name": "Bitcoin",    "currency": "EUR"},
 ]
+
+# Mapa ticker → info de activo (para lookup rápido en /add)
+ASSETS_MAP = {a["ticker"]: a for a in ASSETS}
 
 
 # ── Excepciones ───────────────────────────────────────────────────────────────
@@ -102,7 +114,7 @@ def add_to_historial(entry: dict):
 
 # ── Descarga ──────────────────────────────────────────────────────────────────
 
-def _download(ticker: str, period: str = "5y", retries: int = 3) -> pd.DataFrame:
+def _download(ticker: str, period: str = "1y", retries: int = 3) -> pd.DataFrame:
     for attempt in range(retries):
         try:
             raw = yf.download(ticker, period=period, interval="1d",
@@ -195,6 +207,203 @@ def calc_stop(price: float, atr: float, don_low: float,
     if prev_stop is not None and stop < prev_stop:
         return prev_stop
     return stop
+
+
+# ── Comandos CLI ──────────────────────────────────────────────────────────────
+
+def cmd_help():
+    """Muestra la ayuda de los comandos disponibles."""
+    ayuda = """
+╔══════════════════════════════════════════════════════════════════╗
+║          Trend-Sustainer — Comandos disponibles                  ║
+╠══════════════════════════════════════════════════════════════════╣
+║                                                                  ║
+║  (sin argumentos)                                                ║
+║    Ejecuta el análisis rotacional completo.                      ║
+║    Descarga datos, calcula indicadores y emite la decisión.      ║
+║                                                                  ║
+║  /help                                                           ║
+║    Muestra esta pantalla de ayuda.                               ║
+║                                                                  ║
+║  /reset [--confirm]                                              ║
+║    Borra el estado actual (posición abierta, stop loss, ratio    ║
+║    ETF) y el historial de operaciones completo.                  ║
+║    Requiere --confirm para ejecutarse (medida de seguridad).     ║
+║                                                                  ║
+║    Ejemplo:                                                      ║
+║      python strategy.py /reset --confirm                         ║
+║                                                                  ║
+║  /add <TICKER> <PRECIO_ENTRADA> [STOP_LOSS]                      ║
+║    Inicializa el estado con una posición ya comprada.            ║
+║    Útil para sincronizar el sistema con una compra manual.       ║
+║                                                                  ║
+║    Argumentos:                                                    ║
+║      TICKER         Ticker del activo (debe estar en el          ║
+║                     catálogo): ETH-EUR, NVDA, GOOGL, MSFT,      ║
+║                     BTC-EUR                                      ║
+║      PRECIO_ENTRADA Precio al que se compró (float)              ║
+║      STOP_LOSS      (Opcional) Stop loss inicial. Si se omite,   ║
+║                     se calcula automáticamente con ATR×3.5       ║
+║                     y Donchian Low descargando datos reales.     ║
+║                                                                  ║
+║    Ejemplos:                                                      ║
+║      python strategy.py /add NVDA 950.50                         ║
+║      python strategy.py /add ETH-EUR 2100.00 1850.00             ║
+║      python strategy.py /add BTC-EUR 58000 52000                 ║
+║                                                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+    print(ayuda)
+
+
+def cmd_reset(confirm: bool = False):
+    """
+    Resetea el estado y el historial.
+    Requiere confirm=True como medida de seguridad.
+    """
+    if not confirm:
+        print("⚠️  ATENCIÓN: Este comando borrará el estado y el historial completo.")
+        print("   Para confirmar, ejecuta:")
+        print("   python strategy.py /reset --confirm")
+        return
+
+    state_borrado    = STATE_FILE.exists()
+    historial_borrado = HISTORIAL_FILE.exists()
+
+    if state_borrado:
+        STATE_FILE.unlink()
+    if historial_borrado:
+        HISTORIAL_FILE.unlink()
+
+    # Guardar estado limpio
+    estado_limpio = {
+        "position_open": False,
+        "ticker":        None,
+        "name":          None,
+        "currency":      None,
+        "entry_price":   None,
+        "stop_loss":     None,
+        "etf_ratio":     None,
+    }
+    save_state(estado_limpio)
+    save_historial([])
+
+    print("✅ Reset completado.")
+    if state_borrado:
+        print(f"   · Estado borrado:    {STATE_FILE}")
+    if historial_borrado:
+        print(f"   · Historial borrado: {HISTORIAL_FILE}")
+    print("   · Archivos reiniciados con valores por defecto.")
+
+
+def cmd_add(ticker: str, entry_price: float, stop_loss: float | None = None):
+    """
+    Inicializa el estado con una posición ya comprada.
+    Si no se proporciona stop_loss, lo calcula descargando datos reales.
+    """
+    ticker = ticker.upper()
+
+    # Validar ticker
+    if ticker not in ASSETS_MAP:
+        tickers_validos = ", ".join(ASSETS_MAP.keys())
+        print(f"❌ Error: ticker '{ticker}' no está en el catálogo.")
+        print(f"   Tickers válidos: {tickers_validos}")
+        sys.exit(1)
+
+    asset = ASSETS_MAP[ticker]
+
+    # Verificar que no haya posición abierta
+    state = load_state()
+    if state.get("position_open"):
+        t_actual = state.get("ticker", "desconocido")
+        print(f"⚠️  Ya hay una posición abierta en {t_actual}.")
+        print("   Usa /reset --confirm antes de añadir una nueva posición.")
+        sys.exit(1)
+
+    # Calcular stop loss automático si no se proporcionó
+    if stop_loss is None:
+        print(f"ℹ️  Stop loss no proporcionado. Descargando datos de {ticker} para calcularlo...")
+        try:
+            time.sleep(2)
+            df  = _download(ticker)
+            df  = calc_indicators(df)
+            row = df.iloc[-1]
+
+            atr     = float(row["atr"])     if not pd.isna(row.get("atr",     float("nan"))) else None
+            don_low = float(row["don_low"]) if not pd.isna(row.get("don_low", float("nan"))) else None
+
+            if atr is None or don_low is None:
+                print("⚠️  No se pudo calcular ATR/Donchian Low (datos insuficientes).")
+                print("   Proporciona el stop loss manualmente:")
+                print(f"   python strategy.py /add {ticker} {entry_price} <STOP_LOSS>")
+                sys.exit(1)
+
+            stop_loss = calc_stop(entry_price, atr, don_low, None)
+            print(f"   ATR={atr:.4f}  Donchian Low={don_low:.4f}")
+            print(f"   Stop Loss calculado: {stop_loss:.4f}")
+
+        except MercadoCerradoError as e:
+            print(f"⚠️  {e}")
+            print("   Proporciona el stop loss manualmente:")
+            print(f"   python strategy.py /add {ticker} {entry_price} <STOP_LOSS>")
+            sys.exit(1)
+        except Exception as e:
+            print(f"❌ Error descargando datos para calcular stop loss: {e}")
+            print("   Proporciona el stop loss manualmente:")
+            print(f"   python strategy.py /add {ticker} {entry_price} <STOP_LOSS>")
+            sys.exit(1)
+
+    # Calcular ratio ETF si el ticker es ETH-EUR
+    etf_ratio = None
+    if ticker == ETH_TICKER:
+        print(f"ℹ️  Ticker es ETH-EUR. Intentando obtener ratio con {ETF_TICKER}...")
+        try:
+            time.sleep(2)
+            etf_data = fetch_etf_price()
+            if etf_data:
+                etf_ratio = etf_data["precio"] / entry_price
+                stop_etf  = stop_loss * etf_ratio
+                print(f"   {ETF_TICKER} precio: {etf_data['precio']:.4f}")
+                print(f"   Ratio ETF/ETH: {etf_ratio:.6f}")
+                print(f"   Stop Loss en {ETF_TICKER}: {stop_etf:.4f}")
+            else:
+                print(f"   No se pudo obtener el precio de {ETF_TICKER}. Se guardará sin ratio.")
+        except Exception as e:
+            print(f"   Advertencia: no se pudo calcular ratio ETF: {e}")
+
+    # Guardar estado
+    fecha_hoy = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    state = {
+        "position_open": True,
+        "ticker":        ticker,
+        "name":          asset["name"],
+        "currency":      asset["currency"],
+        "entry_price":   entry_price,
+        "stop_loss":     round(stop_loss, 6),
+        "etf_ratio":     round(etf_ratio, 6) if etf_ratio else None,
+    }
+    save_state(state)
+
+    # Registrar en historial
+    add_to_historial({
+        "fecha":    fecha_hoy,
+        "accion":   ticker,
+        "nombre":   asset["name"],
+        "tipo":     "COMPRA (manual /add)",
+        "precio":   round(entry_price, 4),
+        "ganancia": "—",
+        "currency": asset["currency"],
+    })
+
+    print(f"""
+✅ Posición inicializada correctamente.
+   Ticker:         {ticker} ({asset['name']})
+   Moneda:         {asset['currency']}
+   Precio entrada: {entry_price:.4f}
+   Stop Loss:      {stop_loss:.4f}
+   ETF Ratio:      {etf_ratio:.6f if etf_ratio else 'N/A'}
+   Registrado en historial como COMPRA (manual /add).
+""")
 
 
 # ── Análisis principal ────────────────────────────────────────────────────────
@@ -461,6 +670,61 @@ def run_analysis() -> dict:
     }
 
 
+# ── Entrypoint CLI ────────────────────────────────────────────────────────────
+
+def main():
+    # Detectar si el primer argumento es un comando slash
+    args = sys.argv[1:]
+
+    if not args:
+        # Análisis normal
+        import pprint
+        pprint.pprint(run_analysis())
+        return
+
+    comando = args[0].lower()
+
+    # ── /help ──────────────────────────────────────────────────────────────
+    if comando == "/help":
+        cmd_help()
+
+    # ── /reset ─────────────────────────────────────────────────────────────
+    elif comando == "/reset":
+        confirm = "--confirm" in args
+        cmd_reset(confirm=confirm)
+
+    # ── /add ───────────────────────────────────────────────────────────────
+    elif comando == "/add":
+        # Sintaxis: /add <TICKER> <PRECIO_ENTRADA> [STOP_LOSS]
+        if len(args) < 3:
+            print("❌ Uso: python strategy.py /add <TICKER> <PRECIO_ENTRADA> [STOP_LOSS]")
+            print("   Ejemplo: python strategy.py /add NVDA 950.50")
+            print("   Ejemplo: python strategy.py /add ETH-EUR 2100.00 1850.00")
+            sys.exit(1)
+
+        ticker_arg = args[1]
+        try:
+            entry_price_arg = float(args[2])
+        except ValueError:
+            print(f"❌ PRECIO_ENTRADA inválido: '{args[2]}'. Debe ser un número.")
+            sys.exit(1)
+
+        stop_loss_arg = None
+        if len(args) >= 4:
+            try:
+                stop_loss_arg = float(args[3])
+            except ValueError:
+                print(f"❌ STOP_LOSS inválido: '{args[3]}'. Debe ser un número.")
+                sys.exit(1)
+
+        cmd_add(ticker_arg, entry_price_arg, stop_loss_arg)
+
+    # ── Comando desconocido ────────────────────────────────────────────────
+    else:
+        print(f"❌ Comando desconocido: '{args[0]}'")
+        print("   Ejecuta 'python strategy.py /help' para ver los comandos disponibles.")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    import pprint
-    pprint.pprint(run_analysis())
+    main()
