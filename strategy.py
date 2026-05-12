@@ -218,7 +218,7 @@ def cmd_help():
 ║          Trend-Sustainer — Comandos disponibles                  ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                  ║
-║  (sin argumentos)                                                ║
+║  ( sin argumentos )                                              ║
 ║    Ejecuta el análisis rotacional completo.                      ║
 ║    Descarga datos, calcula indicadores y emite la decisión.      ║
 ║                                                                  ║
