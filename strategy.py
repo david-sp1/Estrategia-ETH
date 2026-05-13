@@ -114,7 +114,7 @@ def add_to_historial(entry: dict):
 
 # ── Descarga ──────────────────────────────────────────────────────────────────
 
-def _download(ticker: str, period: str = "10m", retries: int = 3) -> pd.DataFrame:
+def _download(ticker: str, period: str = "10mo", retries: int = 3) -> pd.DataFrame:
     for attempt in range(retries):
         try:
             raw = yf.download(ticker, period=period, interval="1d",
@@ -149,7 +149,7 @@ def fetch_all_assets() -> dict[str, pd.DataFrame]:
     data = {}
     for i, asset in enumerate(ASSETS):
         if i > 0:
-            time.sleep(10)  # pausa entre activos para evitar rate limiting
+            time.sleep(15)  # pausa entre activos para evitar rate limiting
         ticker = asset["ticker"]
         try:
             data[ticker] = _download(ticker)
@@ -164,7 +164,7 @@ def fetch_etf_price() -> dict | None:
     """Precio actual del ETF ETHC.DE."""
     try:
         time.sleep(15)
-        df = _download(ETF_TICKER, period="1y")
+        df = _download(ETF_TICKER, period="10mo")
         return {
             "precio": float(df["close"].iloc[-1]),
             "fecha":  df.index[-1].strftime("%Y-%m-%d"),
