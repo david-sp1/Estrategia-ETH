@@ -6,7 +6,7 @@ Lógica:
   - Entra en el activo con mayor momentum ROC(20) que cumpla las 3 condiciones
   - Rota si otro activo tiene momentum >15% superior al actual
   - Sale si Close < Stop Loss o Close < SMA200 × (1 - buffer)
-  - Stop Loss: max(precio - ATR×3.5, Donchian_Low) con trinquete
+  - Stop Loss: max(precio - ATR×3, Donchian_Low) con trinquete
   - ETH: indicadores sobre ETH-EUR, precio/stop traducido a ETHC.DE
 
 Comandos CLI:
@@ -40,7 +40,7 @@ PERIODO_SMA        = 200
 PERIODO_ADX        = 14
 PERIODO_ATR        = 14
 PERIODO_ROC        = 20
-MULTIPLICADOR_ATR  = 3.5
+MULTIPLICADOR_ATR  = 3
 UMBRAL_ADX         = 25
 BUFFER_SMA         = 0.02   # 2% — precio debe estar 2% sobre/bajo SMA para señal
 UMBRAL_ROTACION    = 0.2   # 20% — momentum del candidato debe superar al actual en 20%
@@ -243,7 +243,7 @@ def cmd_help():
 ║                     BTC-EUR                                      ║
 ║      PRECIO_ENTRADA Precio al que se compró (float)              ║
 ║      STOP_LOSS      (Opcional) Stop loss inicial. Si se omite,   ║
-║                     se calcula automáticamente con ATR×3.5       ║
+║                     se calcula automáticamente con ATR×3       ║
 ║                     y Donchian Low descargando datos reales.     ║
 ║                                                                  ║
 ║    Ejemplos:                                                      ║
